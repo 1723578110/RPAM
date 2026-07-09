@@ -81,6 +81,26 @@ MotuBrain 在此基础上进一步加强了三流 MoT、多视角输入、跨 em
 
 因此，我们不是再证明 video-action joint modeling 有效，而是要证明 **history-grounded temporal belief** 能提升部分可观测、历史依赖任务中的动作正确性。
 
+### 2.5 π0.7 与 metadata conditioning
+
+π0.7 的重要启发是：模型不一定只靠原始 observation/action 学习，也可以通过额外 metadata 或 context prompt 更好地理解一条数据应该如何被使用。它利用 subtask instruction、subgoal image、episode metadata 等上下文，让策略更可控，也更容易从异构数据中学习。
+
+这对我们的启发是：
+
+> memory 不应只是模型从长历史中隐式学出来的东西，而可以被设计成一种 execution-relevant metadata，用来告诉模型这段历史中哪些事实对下一步动作有用。
+
+但 π0.7 的目标主要是提升 generalist policy 的 steerability 和数据利用效率；我们的目标是让模型在关键阶段显式回顾历史，并验证这类回顾是否会因果地改变动作。
+
+因此，区别可以概括为：
+
+| 方向 | π0.7 | Ours |
+|---|---|---|
+| metadata 作用 | 引导模型理解任务、数据和子目标 | 引导模型回忆执行相关历史事实 |
+| 核心目标 | steerable generalist policy | history-conditioned action correctness |
+| 历史使用 | video history / context conditioning | memory metadata + temporal belief update |
+| 监督重点 | subtask、subgoal、episode context | progress、memory、precondition、effect |
+| 评测重点 | 泛化与可控性 | 当前帧相同但历史不同，动作是否正确改变 |
+
 ## 3. Ours：不同点与优势
 
 我们的方案不是“Motus 加一个 memory head”。核心变化是让 memory 和 progress 进入动作生成状态。
@@ -190,6 +210,8 @@ $$
 
 ### 5.2 标注 Schema
 
+受 π0.7 metadata conditioning 的启发，我们将显式设计 **memory metadata**。它不是普通 episode 描述，而是标注“当前动作需要从历史中回忆什么”。
+
 每个 trajectory segment 标注：
 
 | 字段 | 含义 |
@@ -206,6 +228,35 @@ $$
 | `next_affordance` | 下一步可操作对象或区域 |
 | `failure_reason` | 不可执行原因 |
 
+一个 memory metadata 样例如下：
+
+```json
+{
+  "progress": "grasp_completed",
+  "completed_steps": ["open_drawer", "grasp_cup"],
+  "relevant_memory": [
+    {
+      "object": "cup",
+      "last_seen": "inside left drawer",
+      "current_visibility": "occluded",
+      "state": "held by gripper",
+      "evidence_step": 12
+    }
+  ],
+  "precondition": [
+    {
+      "condition": "target_container_open",
+      "status": "satisfied"
+    }
+  ],
+  "next_intent": "move cup to target container"
+}
+```
+
+也可以配套生成自然语言版本，用于 SFT：
+
+> 历史回顾：杯子已经在第 12 步被夹爪拿起，目标抽屉已经打开。当前任务处于放置阶段，下一步应将杯子移动到目标容器内，而不是重新搜索杯子。
+
 ### 5.3 半自动标注流程
 
 1. 用 VLM 将 trajectory 分段，生成 subtask/progress/keyframe caption；
@@ -216,7 +267,44 @@ $$
 6. 构造 counterfactual pairs；
 7. 人工审核 50-100 个 segment，形成 label audit set。
 
-### 5.4 Counterfactual 数据
+### 5.4 Memory-SFT 数据
+
+除了普通 trajectory 标签，还需要构造一批专门的 **Memory-SFT 数据**，教模型在关键阶段输出正确历史回顾。
+
+触发历史回顾的时机包括：
+
+- action chunk 结束；
+- 子任务切换；
+- 目标物体当前不可见；
+- 当前观测与任务目标不匹配；
+- 前置条件不确定；
+- 模型 action confidence 下降；
+- 预测未来和实际观测出现明显偏差。
+
+每条 Memory-SFT 样本包含：
+
+```text
+History:
+  过去若干 observation/action chunks
+
+Current:
+  当前 observation + instruction
+
+Memory Metadata:
+  当前任务进度
+  需要召回的历史事实
+  当前不可见但重要的物体状态
+  下一步动作的前置条件
+  历史回顾对下一步动作的含义
+
+Target:
+  历史回顾文本/结构化 memory
+  下一段 action chunk
+```
+
+这一步的作用类似 π0.7 中 metadata 对数据使用方式的引导，但我们的 metadata 更聚焦执行记忆：它告诉模型“这段历史里哪些事实会影响下一步动作”。
+
+### 5.5 Counterfactual 数据
 
 关键数据形式：
 
@@ -263,7 +351,31 @@ $$
 L_{stage1} = L_{progress} + L_{memory} + L_{precondition} + L_{effect}
 $$
 
-### Stage 2：Belief-Conditioned Action Training
+### Stage 2：Memory-SFT
+
+专门使用 Memory-SFT 数据，让模型在关键节点学会输出正确的历史回顾。训练目标不是让模型复述完整过去，而是让它输出对下一步动作有用的 memory metadata。
+
+监督形式包括两种：
+
+1. **结构化 memory 监督**  
+   预测 progress、relevant memory、precondition、next intent 等字段。
+
+2. **自然语言回顾监督**  
+   生成简短历史回顾，方便调试和人工检查。
+
+这一阶段可以采用 teacher forcing：
+
+$$
+\text{history}, o_t, l \rightarrow \hat{m}_t, \hat{r}_t
+$$
+
+并训练模型把 gold memory 用于动作预测：
+
+$$
+o_t, l, m_t^{gold}, r_t^{gold} \rightarrow a_{t:t+H}
+$$
+
+### Stage 3：Belief-Conditioned Action Training
 
 解冻 action expert 和 belief-action attention，让 memory/progress/belief 真正进入动作生成。
 
@@ -280,7 +392,15 @@ $$
 
 其中 \(L_{cf}\) 是 counterfactual consistency loss。
 
-### Stage 3：联合微调
+训练时需要同时覆盖：
+
+- gold memory → action；
+- predicted memory → action；
+- shuffled memory → action degradation。
+
+这样可以避免模型只会“说对 memory”，但 action 实际不使用 memory。
+
+### Stage 4：联合微调
 
 混合普通轨迹和历史依赖任务：
 
@@ -302,6 +422,20 @@ $$
 5. precondition head 输出可执行性分数；
 6. 可选输出 progress/memory 诊断；
 7. 默认不做完整视频 rollout。
+
+整体推理应采用 chunk-level 的“执行-回顾-预测-再执行”循环：
+
+$$
+\text{execute action chunk}
+\rightarrow
+\text{retrospective memory update}
+\rightarrow
+\text{future latent prediction}
+\rightarrow
+\text{next action chunk}
+$$
+
+也就是说，模型不是每一帧都回忆，而是在关键决策节点回顾过去、更新 belief，再预测未来 latent 或 affordance，并生成下一段动作。
 
 ### 7.2 评测指标
 
@@ -397,4 +531,3 @@ HCAC 即 history-conditioned action correctness。
 **Motus 回答：** 通常下一步会发生什么？
 
 **Ours 回答：** 在这段历史之后，下一步应该发生什么？
-
